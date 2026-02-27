@@ -50,6 +50,22 @@ func (c *fileConnection) Open() error {
 	return os.MkdirAll(c.root, 0o755)
 }
 
+func (c *fileConnection) Capabilities() search.Capabilities {
+	return search.Capabilities{
+		SyncIndex: true,
+		Clear:     true,
+		Upsert:    true,
+		Delete:    true,
+		Search:    true,
+		Count:     true,
+		Suggest:   false,
+		Sort:      true,
+		Facets:    true,
+		Highlight: true,
+		FilterOps: []string{OpEq, OpIn, OpGt, OpGte, OpLt, OpLte, OpRange},
+	}
+}
+
 func (c *fileConnection) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -61,7 +77,7 @@ func (c *fileConnection) Close() error {
 	return nil
 }
 
-func (c *fileConnection) CreateIndex(name string, index search.Index) error {
+func (c *fileConnection) SyncIndex(name string, index search.Index) error {
 	c.mu.Lock()
 	c.defs[name] = index
 	c.mu.Unlock()
@@ -69,33 +85,42 @@ func (c *fileConnection) CreateIndex(name string, index search.Index) error {
 	return err
 }
 
-func (c *fileConnection) DropIndex(name string) error {
+func (c *fileConnection) Clear(name string) error {
 	c.mu.Lock()
-	if idx, ok := c.indexes[name]; ok {
+	if idx, ok := c.indexes[name]; ok && idx != nil {
 		_ = idx.Close()
 		delete(c.indexes, name)
 	}
+	indexDef := c.defs[name]
 	c.mu.Unlock()
-	return os.RemoveAll(c.indexPath(name))
+
+	if err := os.RemoveAll(c.indexPath(name)); err != nil {
+		return err
+	}
+	return c.SyncIndex(name, indexDef)
 }
 
-func (c *fileConnection) Upsert(index string, docs []search.Document) error {
+func (c *fileConnection) Upsert(index string, rows []Map) error {
 	idx, err := c.ensure(index)
 	if err != nil {
 		return err
 	}
 	batch := idx.NewBatch()
-	for _, doc := range docs {
-		if doc.ID == "" {
+	for _, row := range rows {
+		if row == nil {
 			continue
 		}
-		payload := cloneMap(doc.Payload)
+		id := fmt.Sprintf("%v", row["id"])
+		if id == "" || id == "<nil>" {
+			continue
+		}
+		payload := cloneMap(row)
 		raw, _ := json.Marshal(payload)
-		docMap := map[string]any{"__id": doc.ID, "__payload": string(raw)}
+		docMap := map[string]any{"__id": id, "__payload": string(raw)}
 		for k, v := range payload {
 			docMap[k] = v
 		}
-		if err := batch.Index(doc.ID, docMap); err != nil {
+		if err := batch.Index(id, docMap); err != nil {
 			return err
 		}
 	}
@@ -147,7 +172,7 @@ func (c *fileConnection) Search(index string, query search.Query) (search.Result
 	if err != nil {
 		return search.Result{}, err
 	}
-	if strings.TrimSpace(query.Keyword) != "" && len(resp.Hits) == 0 {
+	if strings.TrimSpace(query.Keyword) != "" && !query.Prefix && len(resp.Hits) == 0 {
 		// Bleve default analyzers are weak on some CJK queries. For file-mode
 		// small projects, fallback to full scan keeps behavior predictable.
 		return c.fallbackSearch(idx, query)
@@ -317,33 +342,6 @@ func (c *fileConnection) Count(index string, query search.Query) (int64, error) 
 	return res.Total, nil
 }
 
-func (c *fileConnection) Suggest(index string, text string, limit int) ([]string, error) {
-	if limit <= 0 {
-		limit = 10
-	}
-	idx, err := c.ensure(index)
-	if err != nil {
-		return nil, err
-	}
-	q := bleve.NewQueryStringQuery(strings.TrimSpace(text) + "*")
-	req := bleve.NewSearchRequestOptions(q, limit, 0, false)
-	req.Fields = []string{"__payload"}
-	resp, err := idx.Search(req)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, len(resp.Hits))
-	set := map[string]struct{}{}
-	for _, hit := range resp.Hits {
-		if _, ok := set[hit.ID]; ok {
-			continue
-		}
-		set[hit.ID] = struct{}{}
-		out = append(out, hit.ID)
-	}
-	return out, nil
-}
-
 func (c *fileConnection) ensure(name string) (bleve.Index, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -414,7 +412,11 @@ func (c *fileConnection) indexPath(name string) string {
 func buildQuery(query search.Query) bquery.Query {
 	parts := make([]bquery.Query, 0)
 	if strings.TrimSpace(query.Keyword) != "" {
-		parts = append(parts, bleve.NewMatchQuery(query.Keyword))
+		if query.Prefix {
+			parts = append(parts, bleve.NewPrefixQuery(strings.TrimSpace(query.Keyword)))
+		} else {
+			parts = append(parts, bleve.NewMatchQuery(query.Keyword))
+		}
 	}
 	for _, f := range query.Filters {
 		if q := filterQuery(f); q != nil {
@@ -434,14 +436,14 @@ func buildQuery(query search.Query) bquery.Query {
 func filterQuery(f search.Filter) bquery.Query {
 	op := strings.ToLower(strings.TrimSpace(f.Op))
 	if op == "" {
-		op = "eq"
+		op = search.FilterEq
 	}
 	switch op {
-	case "eq", "=":
+	case search.FilterEq, "=":
 		q := bleve.NewTermQuery(fmt.Sprintf("%v", f.Value))
 		q.SetField(f.Field)
 		return q
-	case "in":
+	case search.FilterIn:
 		arr := f.Values
 		if len(arr) == 0 && f.Value != nil {
 			arr = []Any{f.Value}
@@ -456,32 +458,32 @@ func filterQuery(f search.Filter) bquery.Query {
 			return nil
 		}
 		return bleve.NewDisjunctionQuery(queries...)
-	case "gt", ">", "gte", ">=", "lt", "<", "lte", "<=", "range":
+	case search.FilterGt, ">", search.FilterGte, ">=", search.FilterLt, "<", search.FilterLte, "<=", search.FilterRange:
 		var min, max *float64
 		incMin := false
 		incMax := false
 		switch op {
-		case "gt", ">":
+		case search.FilterGt, ">":
 			if v, ok := toFloat64(f.Value); ok {
 				min = &v
 			}
 			incMin = false
-		case "gte", ">=":
+		case search.FilterGte, ">=":
 			if v, ok := toFloat64(f.Value); ok {
 				min = &v
 			}
 			incMin = true
-		case "lt", "<":
+		case search.FilterLt, "<":
 			if v, ok := toFloat64(f.Value); ok {
 				max = &v
 			}
 			incMax = false
-		case "lte", "<=":
+		case search.FilterLte, "<=":
 			if v, ok := toFloat64(f.Value); ok {
 				max = &v
 			}
 			incMax = true
-		case "range":
+		case search.FilterRange:
 			if v, ok := toFloat64(f.Min); ok {
 				min = &v
 				incMin = true
